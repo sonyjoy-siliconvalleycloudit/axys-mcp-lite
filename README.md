@@ -30,7 +30,7 @@ npm install -g axys-mcp-lite
 ### From Source
 
 ```bash
-git clone https://github.com/sonyjoy-siliconvalleycloudit/axys-mcp-lite.git
+git clone https://github.com/rajesh-siliconvalleycloudit/axys-mcp-lite.git
 cd axys-mcp-lite
 npm install
 npm run build
@@ -203,7 +203,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Support
 
 For issues:
-- **MCP Server**: [Open an issue](https://github.com/sonyjoy-siliconvalleycloudit/axys-mcp-lite/issues)
+- **MCP Server**: [Open an issue](https://github.com/rajesh-siliconvalleycloudit/axys-mcp-lite/issues)
 - **MCP Protocol**: [MCP Documentation](https://github.com/modelcontextprotocol/docs)
 
 ## License

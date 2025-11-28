@@ -1,47 +1,84 @@
 #!/usr/bin/env node
+import 'dotenv/config';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   ErrorCode,
-  McpError
+  McpError,
+  isInitializeRequest
 } from "@modelcontextprotocol/sdk/types.js";
-import { config } from 'dotenv';
+import express, { Request, Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { GptMcpClient } from './axys-client.js';
 import { GptSearchRequest } from './types.js';
 
-// Load environment variables
-config();
-
-// Validate environment variables
-const API_HOST = process.env.AXYS_API_HOST;
-const MCP_KEY = process.env.MCP_KEY;
-
-if (!API_HOST || !MCP_KEY) {
-  console.error("Error: Missing required environment variables AXYS_API_HOST or MCP_KEY");
-  console.error("Please create a .env file with these variables or set them in your environment");
-  process.exit(1);
+// Config interface for Smithery
+interface SmitheryConfig {
+  AXYS_API_HOST?: string;
+  MCP_KEY?: string;
 }
 
-// Initialize MCP client
-const mcpClient = new GptMcpClient({
-  host: API_HOST,
-  mcpKey: MCP_KEY
-});
+// Store MCP clients by config hash to reuse connections
+const mcpClients: Map<string, GptMcpClient> = new Map();
 
-// Create the MCP server instance
-const server = new Server(
-  {
-    name: "axys-mcp-lite",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
+// Default MCP client (from env vars, for local development)
+let defaultMcpClient: GptMcpClient | null = null;
+
+// Helper to get or create MCP client for a config
+function getMcpClient(config?: SmitheryConfig): GptMcpClient | null {
+  // If config provided (from Smithery query param), use it
+  if (config && config.MCP_KEY) {
+    const apiHost = config.AXYS_API_HOST || 'https://directory.axys.ai';
+    const configKey = `${apiHost}:${config.MCP_KEY}`;
+
+    if (!mcpClients.has(configKey)) {
+      console.error(`Creating new MCP client for config`);
+      mcpClients.set(configKey, new GptMcpClient({
+        host: apiHost,
+        mcpKey: config.MCP_KEY
+      }));
+    }
+    return mcpClients.get(configKey)!;
   }
-);
+
+  // Fall back to default client (from env vars)
+  return defaultMcpClient;
+}
+
+// Parse config from query parameters (Smithery passes config as URL params)
+function parseConfigFromQuery(req: Request): SmitheryConfig | undefined {
+  // Log all query params for debugging
+  console.error(`Query params received: ${JSON.stringify(req.query)}`);
+
+  // Method 1: Direct query params (Smithery HTTP format)
+  // e.g., ?AXYS_API_HOST=xxx&MCP_KEY=yyy
+  if (req.query.MCP_KEY || req.query.AXYS_API_HOST) {
+    const config: SmitheryConfig = {
+      AXYS_API_HOST: req.query.AXYS_API_HOST as string,
+      MCP_KEY: req.query.MCP_KEY as string
+    };
+    console.error(`Parsed config from direct query params: AXYS_API_HOST=${config.AXYS_API_HOST}, MCP_KEY=${config.MCP_KEY ? '[SET]' : '[NOT SET]'}`);
+    return config;
+  }
+
+  // Method 2: JSON config param (fallback)
+  // e.g., ?config={"AXYS_API_HOST":"xxx","MCP_KEY":"yyy"}
+  const configParam = req.query.config;
+  if (configParam && typeof configParam === 'string') {
+    try {
+      const decoded = decodeURIComponent(configParam);
+      const config = JSON.parse(decoded) as SmitheryConfig;
+      console.error(`Parsed config from JSON query param: AXYS_API_HOST=${config.AXYS_API_HOST}, MCP_KEY=${config.MCP_KEY ? '[SET]' : '[NOT SET]'}`);
+      return config;
+    } catch (e) {
+      console.error(`Failed to parse JSON config from query: ${e}`);
+    }
+  }
+
+  return undefined;
+}
 
 // Define MCP AI tools
 const TOOLS = [
@@ -109,141 +146,317 @@ function logToolResult(toolName: string, success: boolean, error?: string) {
   }
 }
 
-// Handle tool listing
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const timestamp = new Date().toISOString();
-  console.error(`[${timestamp}] Client requested tool list`);
-  return {
-    tools: TOOLS,
-  };
-});
+// Create the MCP server with handlers
+function createMcpServer(config?: SmitheryConfig) {
+  // Get the MCP client for this config
+  const mcpClient = getMcpClient(config);
 
-// Handle tool execution
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  // Log the incoming tool call
-  logToolCall(name, args);
-
-  try {
-    switch (name) {
-      case "ai_search_structured": {
-        const query = args?.query as string;
-        if (!query) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            "query is required"
-          );
-        }
-
-        const searchRequest: GptSearchRequest = {
-          query,
-          searchType: 'structured'
-        };
-
-        const result = await mcpClient.aiSearch(searchRequest);
-        logToolResult(name, true);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
-      }
-
-      case "ai_search_unstructured": {
-        const query = args?.query as string;
-        if (!query) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            "query is required"
-          );
-        }
-
-        const searchRequest: GptSearchRequest = {
-          query,
-          searchType: 'unstructured'
-        };
-
-        if (args?.searchIndices) {
-          searchRequest.searchIndices = args.searchIndices as string;
-        }
-
-        if (args?.fileOnly !== undefined) {
-          searchRequest.fileOnly = args.fileOnly as boolean;
-        }
-
-        const result = await mcpClient.aiSearch(searchRequest);
-        logToolResult(name, true);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
-      }
-
-      case "validate_connection": {
-        const isValid = await mcpClient.validateConnection();
-        logToolResult(name, true);
-        return {
-          content: [
-            {
-              type: "text",
-              text: isValid
-                ? "✓ Connection to MCP API is valid and working"
-                : "✗ Failed to connect to MCP API. Please check your configuration."
-            }
-          ]
-        };
-      }
-
-      default:
-        logToolResult(name, false, `Unknown tool: ${name}`);
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `Unknown tool: ${name}`
-        );
+  const server = new Server(
+    {
+      name: "axys-mcp-lite",
+      version: "1.0.0",
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
     }
-  } catch (error) {
-    // Log failed execution
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    logToolResult(name, false, errorMessage);
+  );
 
-    if (error instanceof McpError) {
-      throw error;
+  // Handle tool listing
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const timestamp = new Date().toISOString();
+    console.error(`[${timestamp}] Client requested tool list`);
+    return {
+      tools: TOOLS,
+    };
+  });
+
+  // Handle tool execution
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+
+    // Log the incoming tool call
+    logToolCall(name, args);
+
+    // Check if client is initialized
+    if (!mcpClient && name !== 'validate_connection') {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: MCP client not initialized. Please check MCP_KEY configuration."
+          }
+        ]
+      };
     }
 
-    // Handle axios errors or other errors
-    throw new McpError(
-      ErrorCode.InternalError,
-      `Error executing ${name}: ${errorMessage}`
-    );
-  }
-});
+    try {
+      switch (name) {
+        case "ai_search_structured": {
+          const query = args?.query as string;
+          if (!query) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              "query is required"
+            );
+          }
 
-// Start the server
+          const searchRequest: GptSearchRequest = {
+            query,
+            searchType: 'structured'
+          };
+
+          const result = await mcpClient!.aiSearch(searchRequest);
+          logToolResult(name, true);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(result, null, 2)
+              }
+            ]
+          };
+        }
+
+        case "ai_search_unstructured": {
+          const query = args?.query as string;
+          if (!query) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              "query is required"
+            );
+          }
+
+          const searchRequest: GptSearchRequest = {
+            query,
+            searchType: 'unstructured'
+          };
+
+          if (args?.searchIndices) {
+            searchRequest.searchIndices = args.searchIndices as string;
+          }
+
+          if (args?.fileOnly !== undefined) {
+            searchRequest.fileOnly = args.fileOnly as boolean;
+          }
+
+          const result = await mcpClient!.aiSearch(searchRequest);
+          logToolResult(name, true);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(result, null, 2)
+              }
+            ]
+          };
+        }
+
+        case "validate_connection": {
+          if (!mcpClient) {
+            logToolResult(name, false, "MCP client not initialized");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "✗ MCP client not initialized. Please check MCP_KEY configuration."
+                }
+              ]
+            };
+          }
+
+          const isValid = await mcpClient.validateConnection();
+          logToolResult(name, true);
+          return {
+            content: [
+              {
+                type: "text",
+                text: isValid
+                  ? "✓ Connection to MCP API is valid and working"
+                  : "✗ Failed to connect to MCP API. Please check your configuration."
+              }
+            ]
+          };
+        }
+
+        default:
+          logToolResult(name, false, `Unknown tool: ${name}`);
+          throw new McpError(
+            ErrorCode.MethodNotFound,
+            `Unknown tool: ${name}`
+          );
+      }
+    } catch (error) {
+      // Log failed execution
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logToolResult(name, false, errorMessage);
+
+      if (error instanceof McpError) {
+        throw error;
+      }
+
+      // Handle axios errors or other errors
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Error executing ${name}: ${errorMessage}`
+      );
+    }
+  });
+
+  return server;
+}
+
+// Main function to start the HTTP server
 async function main() {
-  // Validate MCP connection
-  console.error("Validating MCP API connection...");
-  const isConnected = await mcpClient.validateConnection();
+  // Get environment variables at runtime (for local development)
+  const API_HOST = process.env.AXYS_API_HOST || 'https://directory.axys.ai';
+  const MCP_KEY = process.env.MCP_KEY || '';
+  const PORT = parseInt(process.env.PORT || '8000', 10);
 
-  if (!isConnected) {
-    console.error("Warning: Could not validate MCP API connection. Please check your MCP_KEY.");
+  console.error(`Starting MCP Server...`);
+  console.error(`API_HOST: ${API_HOST}`);
+  console.error(`MCP_KEY from env: ${MCP_KEY ? '[SET]' : '[NOT SET]'}`);
+  console.error(`PORT: ${PORT}`);
+
+  // Initialize default MCP client from env vars (for local development)
+  if (MCP_KEY) {
+    defaultMcpClient = new GptMcpClient({
+      host: API_HOST,
+      mcpKey: MCP_KEY
+    });
+    console.error(`Default MCP client initialized from env vars`);
   } else {
-    console.error("Successfully connected to MCP API");
+    console.error(`No MCP_KEY in env - will use config from query params (Smithery mode)`);
   }
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const app = express();
+  app.use(express.json());
 
-  console.error("MCP Server is running on stdio");
-  console.error(`Connected to: ${API_HOST}`);
-  console.error(`Total tools available: ${TOOLS.length}`);
+  // Store active transports by session ID
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  // Health check endpoint
+  app.get('/health', (_req: Request, res: Response) => {
+    res.json({ status: 'ok' });
+  });
+
+  // MCP endpoint - handles POST requests
+  app.post('/mcp', async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    // Parse config from query parameter (Smithery passes config this way)
+    const config = parseConfigFromQuery(req);
+
+    console.error(`Received MCP POST request, session: ${sessionId || 'new'}, config: ${config ? 'provided' : 'none'}`);
+
+    try {
+      let transport: StreamableHTTPServerTransport;
+
+      if (sessionId && transports[sessionId]) {
+        // Reuse existing transport
+        transport = transports[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        // New initialization request - create new transport
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (newSessionId) => {
+            console.error(`Session initialized: ${newSessionId}`);
+            transports[newSessionId] = transport;
+          }
+        });
+
+        // Clean up on close
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid && transports[sid]) {
+            console.error(`Transport closed for session ${sid}`);
+            delete transports[sid];
+          }
+        };
+
+        // Connect transport to MCP server with config from query params
+        const server = createMcpServer(config);
+        await server.connect(transport);
+      } else {
+        // Invalid request
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Bad Request: No valid session ID provided'
+          },
+          id: null
+        });
+        return;
+      }
+
+      // Handle the request
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error('Error handling MCP request:', error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32603,
+            message: 'Internal server error'
+          },
+          id: null
+        });
+      }
+    }
+  });
+
+  // Handle GET requests for SSE streams
+  app.get('/mcp', async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+
+    console.error(`SSE stream request for session: ${sessionId}`);
+    const transport = transports[sessionId];
+    await transport.handleRequest(req, res);
+  });
+
+  // Handle DELETE requests for session termination
+  app.delete('/mcp', async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+
+    console.error(`Session termination request for: ${sessionId}`);
+    const transport = transports[sessionId];
+    await transport.handleRequest(req, res);
+  });
+
+  // Start server on 0.0.0.0 for container compatibility
+  app.listen(PORT, '0.0.0.0', () => {
+    console.error(`MCP Server is running on HTTP port ${PORT}`);
+    console.error(`Listening on 0.0.0.0:${PORT}`);
+    console.error(`Total tools available: ${TOOLS.length}`);
+    console.error(`MCP endpoint: http://0.0.0.0:${PORT}/mcp`);
+  });
+
+  // Handle server shutdown
+  process.on('SIGINT', async () => {
+    console.error('Shutting down server...');
+    for (const sessionId in transports) {
+      try {
+        await transports[sessionId].close();
+        delete transports[sessionId];
+      } catch (error) {
+        console.error(`Error closing transport for session ${sessionId}:`, error);
+      }
+    }
+    process.exit(0);
+  });
 }
 
 main().catch((error) => {
